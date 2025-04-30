@@ -7,6 +7,8 @@ from urllib.parse import urljoin, urlparse
 import argparse
 from typing import List, Set, Tuple
 import sys
+import os
+import datetime
 
 class EmailScraper:
     def __init__(self):
@@ -34,23 +36,47 @@ class EmailScraper:
             print(f"Error fetching {url}: {str(e)}", file=sys.stderr)
             return ""
     
-    def scrape_emails(self, url: str) -> Tuple[Set[str], Set[str]]:
-        """Scrape emails from a webpage and categorize them as valid/invalid."""
+    def extract_logged_in_email(self, soup) -> str:
+        # For temp-mail.org, the email is in <input id="mail" value="...">
+        mail_input = soup.find('input', {'id': 'mail'})
+        if mail_input and mail_input.has_attr('value'):
+            return mail_input['value']
+        return None
+
+    def log_email(self, email: str, log_file: str):
+        now = datetime.datetime.now().isoformat()
+        with open(log_file, 'a') as f:
+            f.write(f"{now}\t{email}\n")
+
+    def get_recent_emails(self, log_file: str, days: int = 3):
+        recent_emails = set()
+        cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+        if not os.path.exists(log_file):
+            return recent_emails
+        with open(log_file, 'r') as f:
+            for line in f:
+                try:
+                    timestamp, email = line.strip().split('\t')
+                    dt = datetime.datetime.fromisoformat(timestamp)
+                    if dt >= cutoff:
+                        recent_emails.add(email)
+                except Exception:
+                    continue
+        return recent_emails
+
+    def scrape_emails(self, url: str, log_file: str) -> tuple:
         content = self.get_page_content(url)
         if not content:
-            return set(), set()
-        
+            return set(), set(), None
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text()
-        
-        # Extract all potential emails
         all_emails = self.extract_emails(text)
-        
-        # Categorize emails
         valid_emails = {email for email in all_emails if self.is_valid_email(email)}
         invalid_emails = all_emails - valid_emails
-        
-        return valid_emails, invalid_emails
+        logged_in_email = self.extract_logged_in_email(soup)
+        if logged_in_email:
+            self.log_email(logged_in_email, log_file)
+        return valid_emails, invalid_emails, logged_in_email
 
 def main():
     parser = argparse.ArgumentParser(description='Web Email Scraper and Validator')
@@ -59,16 +85,34 @@ def main():
     args = parser.parse_args()
     
     scraper = EmailScraper()
-    valid_emails, invalid_emails = scraper.scrape_emails(args.url)
+    log_file = 'email_history.log'
+    valid_emails, invalid_emails, logged_in_email = scraper.scrape_emails(args.url, log_file)
     
     # Prepare output
     output = []
     output.append(f"URL: {args.url}")
-    output.append("\nValid Emails:")
+    output.append("")
+    output.append("Logged-in Email:")
+    if logged_in_email:
+        validity = "Valid" if scraper.is_valid_email(logged_in_email) else "Invalid"
+        output.append(f"  {logged_in_email} ({validity})")
+    else:
+        output.append("  Not found")
+    output.append("")
+    output.append("Emails used in the last 3 days:")
+    recent_emails = scraper.get_recent_emails(log_file, days=3)
+    if recent_emails:
+        for email in sorted(recent_emails):
+            validity = "Valid" if scraper.is_valid_email(email) else "Invalid"
+            output.append(f"  {email} ({validity})")
+    else:
+        output.append("  None found")
+    output.append("")
+    output.append("Valid Emails:")
     for email in sorted(valid_emails):
         output.append(f"  {email}")
-    
-    output.append("\nInvalid Emails:")
+    output.append("")
+    output.append("Invalid Emails:")
     for email in sorted(invalid_emails):
         output.append(f"  {email}")
     
