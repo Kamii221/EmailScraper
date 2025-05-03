@@ -15,7 +15,7 @@ A command-line tool that scrapes email addresses from websites and identifies in
 1. Clone this repository:
 ```bash
 git clone https://github.com/Kamii221/EmailScraper
-cd email-scraper
+cd EmailScraper
 ```
 
 2. Make the scripts executable:
