@@ -586,8 +586,10 @@ class EmailScraper:
             elements = soup.select(selector)
             for element in elements:
                 email = element.get('value', '') or element.get_text()
-                if email and self.is_valid_email(email):
-                    return email
+                if email:
+                    email = self.clean_email(email)
+                    if email and self.is_valid_email(email):
+                        return email
         return None
 
     def validate_email_with_feedback(self, email: str) -> Tuple[bool, List[str]]:
@@ -596,9 +598,10 @@ class EmailScraper:
         
         try:
             # Clean up the email string
-            email = email.strip()
-            email = re.sub(r'[^\w\s@.-]', '', email)
-            email = re.sub(r'\s+', '', email)
+            email = self.clean_email(email)
+            if not email:
+                reasons.append("Invalid email format")
+                return False, reasons
             
             # Basic format validation
             if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
@@ -701,8 +704,7 @@ def main():
     output.append("")
     output.append("Logged-in Email:")
     if logged_in_email:
-        validity = "Valid" if scraper.is_valid_email(logged_in_email) else "Invalid"
-        output.append(f"  {logged_in_email} ({validity})")
+        output.append(f"  {logged_in_email}")
     else:
         output.append("  Not found")
     output.append("")
