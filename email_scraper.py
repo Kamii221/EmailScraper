@@ -12,18 +12,31 @@ import datetime
 import logging
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import urllib3
+
+# Disable SSL warnings
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class EmailScraper:
     def __init__(self, 
                  log_file: str = 'email_history.log',
-                 timeout: int = 10,
+                 timeout: int = 30,
                  max_retries: int = 3,
+                 verify_ssl: bool = False,  # Make SSL verification optional
                  user_agent: str = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'):
-        # Regular expression for email validation
-        self.email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+        # Regular expressions for email validation
+        self.email_patterns = [
+            re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),  # Standard email
+            re.compile(r'[a-zA-Z0-9._%+-]+\[at\][a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),  # [at] format
+            re.compile(r'[a-zA-Z0-9._%+-]+\s*@\s*[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),  # Spaces around @
+            re.compile(r'[a-zA-Z0-9._%+-]+\s*\[at\]\s*[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),  # Spaces around [at]
+            re.compile(r'mailto:([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})'),  # mailto: links
+        ]
         self.log_file = log_file
         self.timeout = timeout
         self.user_agent = user_agent
+        self.verify_ssl = verify_ssl
+        self.visited_urls = set()
         
         # Configure logging
         logging.basicConfig(
@@ -42,36 +55,99 @@ class EmailScraper:
         adapter = HTTPAdapter(max_retries=retry_strategy)
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
+        self.session.headers.update({'User-Agent': user_agent})
+        self.session.verify = verify_ssl  # Set SSL verification
         
     def is_valid_email(self, email: str) -> bool:
         """Validate if an email follows standard format."""
-        return bool(self.email_pattern.fullmatch(email))
+        # Clean up the email first
+        email = email.replace('[at]', '@').replace(' ', '')
+        if email.startswith('mailto:'):
+            email = email[7:]
+        return bool(self.email_patterns[0].fullmatch(email))
     
     def extract_emails(self, text: str) -> Set[str]:
-        """Extract all email addresses from text."""
-        return set(self.email_pattern.findall(text))
+        """Extract all email addresses from text using multiple patterns."""
+        emails = set()
+        for pattern in self.email_patterns:
+            matches = pattern.findall(text)
+            for match in matches:
+                # Handle tuple results from groups in regex
+                if isinstance(match, tuple):
+                    match = match[0]
+                # Clean up the email
+                email = match.replace('[at]', '@').replace(' ', '')
+                if email.startswith('mailto:'):
+                    email = email[7:]
+                emails.add(email)
+        return emails
+    
+    def get_contact_links(self, soup: BeautifulSoup, base_url: str) -> List[str]:
+        """Extract contact page links from the page."""
+        contact_links = []
+        contact_keywords = ['contact', 'about', 'support', 'help', 'customer', 'privacy', 'terms']
+        
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '').lower()
+            text = link.get_text().lower()
+            
+            if any(keyword in href or keyword in text for keyword in contact_keywords):
+                full_url = urljoin(base_url, href)
+                if full_url not in self.visited_urls and urlparse(full_url).netloc == urlparse(base_url).netloc:
+                    contact_links.append(full_url)
+        
+        return contact_links
     
     def get_page_content(self, url: str) -> Optional[str]:
-        """Fetch webpage content with enhanced error handling."""
+        """Fetch webpage content using requests."""
+        if url in self.visited_urls:
+            return None
+            
+        self.visited_urls.add(url)
         try:
-            headers = {'User-Agent': self.user_agent}
-            response = self.session.get(
-                url, 
-                headers=headers, 
-                timeout=self.timeout,
-                verify=True  # SSL verification
-            )
+            response = self.session.get(url, timeout=self.timeout)
             response.raise_for_status()
-            return response.text
+            content = response.text
+            
+            # Parse the content
+            soup = BeautifulSoup(content, 'html.parser')
+            
+            # Check for contact pages
+            contact_links = self.get_contact_links(soup, url)
+            
+            # Visit contact pages
+            all_content = [content]
+            for link in contact_links[:3]:  # Limit to first 3 contact pages
+                try:
+                    response = self.session.get(link, timeout=self.timeout)
+                    response.raise_for_status()
+                    all_content.append(response.text)
+                except Exception as e:
+                    self.logger.warning(f"Error fetching contact page {link}: {str(e)}")
+            
+            return '\n'.join(all_content)
+            
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Error fetching {url}: {str(e)}")
             return None
     
     def extract_logged_in_email(self, soup) -> Optional[str]:
         """Extract logged-in email from the page."""
-        mail_input = soup.find('input', {'id': 'mail'})
-        if mail_input and mail_input.has_attr('value'):
-            return mail_input['value']
+        # Look for common patterns where logged-in email might be displayed
+        selectors = [
+            'input[type="email"][value]',  # Email input with value
+            '.user-email',  # Common class for user email
+            '#user-email',  # Common ID for user email
+            '.account-email',  # Common class for account email
+            '.profile-email'  # Common class for profile email
+        ]
+        
+        for selector in selectors:
+            elements = soup.select(selector)
+            for element in elements:
+                email = element.get('value', '') or element.get_text()
+                if email and self.is_valid_email(email):
+                    return email
         return None
 
     def log_email(self, email: str):
@@ -116,6 +192,15 @@ class EmailScraper:
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text()
         all_emails = self.extract_emails(text)
+        
+        # Also check href attributes for mailto: links
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '')
+            if href.startswith('mailto:'):
+                email = href[7:]  # Remove mailto:
+                if self.is_valid_email(email):
+                    all_emails.add(email)
+        
         valid_emails = {email for email in all_emails if self.is_valid_email(email)}
         invalid_emails = all_emails - valid_emails
         logged_in_email = self.extract_logged_in_email(soup)
