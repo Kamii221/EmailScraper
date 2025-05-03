@@ -30,7 +30,6 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class EmailScraper:
     def __init__(self, 
-                 log_file: str = 'email_history.log',
                  timeout: int = 30,
                  max_retries: int = 3,
                  verify_ssl: bool = False,
@@ -145,7 +144,6 @@ class EmailScraper:
             'tempinbox.me',
         }
         
-        self.log_file = log_file
         self.timeout = timeout
         self.verify_ssl = verify_ssl
         self.visited_urls = set()
@@ -592,38 +590,54 @@ class EmailScraper:
                     return email
         return None
 
-    def log_email(self, email: str):
-        """Log email with timestamp."""
-        now = datetime.datetime.now().isoformat()
-        try:
-            with open(self.log_file, 'a') as f:
-                f.write(f"{now}\t{email}\n")
-        except IOError as e:
-            self.logger.error(f"Error writing to log file: {str(e)}")
-
-    def get_recent_emails(self, days: int = 3) -> Set[str]:
-        """Get emails from the last N days."""
-        recent_emails = set()
-        cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    def validate_email_with_feedback(self, email: str) -> Tuple[bool, List[str]]:
+        """Validate email and return reasons if invalid."""
+        reasons = []
         
-        if not os.path.exists(self.log_file):
-            return recent_emails
-            
         try:
-            with open(self.log_file, 'r') as f:
-                for line in f:
-                    try:
-                        timestamp, email = line.strip().split('\t')
-                        dt = datetime.datetime.fromisoformat(timestamp)
-                        if dt >= cutoff:
-                            recent_emails.add(email)
-                    except (ValueError, IndexError) as e:
-                        self.logger.warning(f"Error parsing log line: {str(e)}")
-                        continue
-        except IOError as e:
-            self.logger.error(f"Error reading log file: {str(e)}")
+            # Clean up the email string
+            email = email.strip()
+            email = re.sub(r'[^\w\s@.-]', '', email)
+            email = re.sub(r'\s+', '', email)
             
-        return recent_emails
+            # Basic format validation
+            if not re.match(r'^[\w\.-]+@[\w\.-]+\.\w+$', email):
+                reasons.append("Invalid email format")
+                return False, reasons
+            
+            # Length checks
+            if len(email) < 5:
+                reasons.append("Email too short (minimum 5 characters)")
+            if len(email) > 254:
+                reasons.append("Email too long (maximum 254 characters)")
+            
+            # Split into local and domain parts
+            local, domain = email.split('@')
+            
+            # Local part checks
+            if len(local) > 64:
+                reasons.append("Local part too long (maximum 64 characters)")
+            if local.startswith('.') or local.endswith('.'):
+                reasons.append("Local part cannot start or end with a dot")
+            if '..' in local:
+                reasons.append("Local part cannot contain consecutive dots")
+            
+            # Domain part checks
+            if domain.startswith('.') or domain.endswith('.'):
+                reasons.append("Domain cannot start or end with a dot")
+            if '..' in domain:
+                reasons.append("Domain cannot contain consecutive dots")
+            if not re.match(r'^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', domain):
+                reasons.append("Invalid domain format")
+            
+            # Check if it's a temporary email domain
+            if domain.lower() in self.temp_email_domains:
+                reasons.append("Email is from a known temporary email service")
+            
+            return len(reasons) == 0, reasons
+        except:
+            reasons.append("Failed to parse email")
+            return False, reasons
 
     def process_url(self, url: str) -> Tuple[Optional[str], Set[str], Set[str]]:
         """Process a URL to extract emails."""
@@ -634,58 +648,43 @@ class EmailScraper:
         # Parse the content
         soup = BeautifulSoup(content, 'html.parser')
         text = soup.get_text()
-        valid_emails, invalid_emails = self.extract_emails(text)
+        valid_emails = set()
+        invalid_emails = set()
         
-        # Also check href attributes for mailto: links
+        # Extract potential emails
+        potential_emails = set()
+        for pattern in self.email_patterns:
+            matches = pattern.finditer(text)
+            for match in matches:
+                email = match.group(1) if len(match.groups()) > 0 else match.group(0)
+                email = self.clean_email(email)
+                if email:
+                    potential_emails.add(email)
+        
+        # Validate each email
+        for email in potential_emails:
+            is_valid, reasons = self.validate_email_with_feedback(email)
+            if is_valid:
+                valid_emails.add(email)
+            else:
+                invalid_emails.add(f"{email} ({', '.join(reasons)})")
+        
+        # Check mailto: links
         for link in soup.find_all('a', href=True):
             href = link['href']
             if href.startswith('mailto:'):
                 email = href[7:]  # Remove mailto:
-                if self.is_valid_email(email):
-                    valid_emails.add(email)
-        
-        # Separate temporary emails from valid emails
-        temp_emails = {email for email in valid_emails if self.is_temp_email(email)}
-        valid_emails = valid_emails - temp_emails
-        invalid_emails.update(temp_emails)  # Add temporary emails to invalid list
+                email = self.clean_email(email)
+                if email:
+                    is_valid, reasons = self.validate_email_with_feedback(email)
+                    if is_valid:
+                        valid_emails.add(email)
+                    else:
+                        invalid_emails.add(f"{email} ({', '.join(reasons)})")
         
         logged_in_email = self.extract_logged_in_email(soup)
         
-        # Log the results
-        self.log_results(url, logged_in_email, valid_emails, invalid_emails)
-        
         return logged_in_email, valid_emails, invalid_emails
-
-    def log_results(self, url: str, logged_in_email: Optional[str], valid_emails: Set[str], invalid_emails: Set[str]):
-        """Log the scraping results."""
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        
-        with open(self.log_file, 'a') as f:
-            f.write(f"\n=== {timestamp} ===\n")
-            f.write(f"URL: {url}\n")
-            
-            if logged_in_email:
-                f.write(f"Logged-in Email: {logged_in_email}\n")
-            
-            if valid_emails:
-                f.write("Valid Emails:\n")
-                for email in sorted(valid_emails):
-                    f.write(f"  {email}\n")
-            
-            if invalid_emails:
-                f.write("Invalid/Temporary Emails:\n")
-                for email in sorted(invalid_emails):
-                    f.write(f"  {email}\n")
-            
-            f.write("\n")
-
-    def is_temp_email(self, email: str) -> bool:
-        """Check if an email is from a known temporary email domain."""
-        try:
-            domain = email.split('@')[1].lower()
-            return domain in self.temp_email_domains
-        except:
-            return False
 
 def main():
     parser = argparse.ArgumentParser(description='Web Email Scraper and Validator')
@@ -706,15 +705,6 @@ def main():
         output.append(f"  {logged_in_email} ({validity})")
     else:
         output.append("  Not found")
-    output.append("")
-    output.append("Emails used in the last 3 days:")
-    recent_emails = scraper.get_recent_emails(days=3)
-    if recent_emails:
-        for email in sorted(recent_emails):
-            validity = "Valid" if scraper.is_valid_email(email) else "Invalid"
-            output.append(f"  {email} ({validity})")
-    else:
-        output.append("  None found")
     output.append("")
     output.append("Valid Emails:")
     for email in sorted(valid_emails):
